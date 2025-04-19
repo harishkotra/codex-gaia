@@ -3,8 +3,9 @@ import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
 import type { AppConfig } from "../config.js";
 import type {
   ResponseFunctionToolCall,
+  ChatCompletionTool,
   ResponseInputItem,
-  ResponseItem,
+  ResponseItem, ChatCompletionMessageParam,
 } from "openai/resources/responses/responses.mjs";
 import type { Reasoning } from "openai/resources.mjs";
 
@@ -18,7 +19,7 @@ import {
   setCurrentModel,
   setSessionId,
 } from "../session.js";
-import { handleExecCommand } from "./handle-exec-command.js";
+import { handleExecCommand, AdditionalItemsFromExec } from "./handle-exec-command.js";
 import { randomUUID } from "node:crypto";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
 
@@ -27,6 +28,14 @@ const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
   process.env["OPENAI_RATE_LIMIT_RETRY_WAIT_MS"] || "2500",
   10,
 );
+
+type ChatCompletionMessage = ChatCompletionMessageParam
+
+interface ChatCompletionStream {
+  controller?: {
+      abort?: () => void;
+  };
+}
 
 export type CommandConfirmation = {
   review: ReviewDecision;
@@ -64,7 +73,7 @@ export class AgentLoop {
   private additionalWritableRoots: ReadonlyArray<string>;
 
   // Using `InstanceType<typeof OpenAI>` sidesteps typing issues with the OpenAI package under
-  // the TS 5+ `moduleResolution=bundler` setup. OpenAI client instance. We keep the concrete
+  // the TS 5+ `moduleResolution=bundler` setup. OpenAI client instance. We keep the concrete.
   // type to avoid sprinkling `any` across the implementation while still allowing paths where
   // the OpenAI SDK types may not perfectly match. The `typeof OpenAI` pattern captures the
   // instance shape without resorting to `any`.
@@ -242,7 +251,7 @@ export class AgentLoop {
     this.sessionId = getSessionId() || randomUUID().replaceAll("-", "");
     // Configure OpenAI client with optional timeout (ms) from environment
     const timeoutMs = OPENAI_TIMEOUT_MS;
-    const apiKey = this.config.apiKey ?? process.env["OPENAI_API_KEY"] ?? "";
+    const apiKey = this.config.apiKey ?? process.env["OPENAI_API_KEY"] ?? process.env["OPENAI_API_KEY"];
     this.oai = new OpenAI({
       // The OpenAI JS SDK only requires `apiKey` when making requests against
       // the official API.  When running unit‑tests we stub out all network
@@ -273,6 +282,54 @@ export class AgentLoop {
   }
 
   private async handleFunctionCall(
+    item: any,
+  ): Promise<Array<ResponseInputItem>> {
+    // If the agent has been canceled in the meantime we should not perform any
+    // additional work. Returning an empty array ensures that we neither execute
+    // the requested tool call nor enqueue any follow‑up input items. This keeps
+    // the cancellation semantics intuitive for users – once they interrupt a
+    // task no further actions related to that task should be taken.
+    if (this.canceled) {
+      return [];
+    }
+
+    // chat endpoint.
+    const name = item.function.name
+    const rawArguments = item.function.arguments;
+    const callId = item.id;
+
+    const args = parseToolCallArguments(rawArguments ?? "{}");
+    if (isLoggingEnabled()) {
+      log(
+        `handleFunctionCall(): name=${name} callId=${callId} args=${rawArguments}`,
+      );
+    }
+    if (args == null) {
+      return []
+    }
+
+    const outputItem: ResponseInputItem.FunctionCallOutput = {
+      type: "function_call_output",
+      // `call_id` is mandatory – ensure we never send `undefined` which would
+      // trigger the "No tool output found…" 400 from the API.
+      call_id: callId,
+      output: "no function found",
+    };
+    // used to tell model to stop if needed
+    const additionalItems: Array<ResponseInputItem> = [];
+
+    // TODO: allow arbitrary function calls (beyond shell/container.exec)
+    if (name === "container.exec" || name === "shell") {
+        const result: AdditionalItemsFromExec = await handleExecCommand(args, this.config, this.approvalPolicy, this.additionalWritableRoots, this.getCommandConfirmation, this.execAbortController?.signal);
+        outputItem.output = JSON.stringify({ output: result.outputText, metadata: result.metadata });
+        if (result.additionalItems) {
+            additionalItems.push(...result.additionalItems)
+        }
+    }
+    return [outputItem, ...additionalItems];
+  }
+
+  private async handleFunctionCallOld(
     item: ResponseFunctionToolCall,
   ): Promise<Array<ResponseInputItem>> {
     // If the agent has been canceled in the meantime we should not perform any
@@ -380,6 +437,7 @@ export class AgentLoop {
 
   public async run(
     input: Array<ResponseInputItem>,
+
     previousResponseId: string = "",
   ): Promise<void> {
     // ---------------------------------------------------------------------
@@ -420,6 +478,8 @@ export class AgentLoop {
       // `MaxListenersExceededWarning` after ten invocations.
 
       let lastResponseId: string = previousResponseId;
+
+      let chatCompletion: any = null;
 
       // If there are unresolved function calls from a previously cancelled run
       // we have to emit dummy tool outputs so that the API no longer expects
@@ -485,7 +545,7 @@ export class AgentLoop {
         for (const item of turnInput) {
           stageItem(item as ResponseItem);
         }
-        // Send request to OpenAI with retry on timeout
+        // Send request to OpenAI with retry on timeout        
         let stream;
 
         // Retry loop for transient errors. Up to MAX_RETRIES attempts.
@@ -507,42 +567,50 @@ export class AgentLoop {
                 `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
               );
             }
-            // eslint-disable-next-line no-await-in-loop
-            stream = await this.oai.responses.create({
-              model: this.model,
-              instructions: mergedInstructions,
-              previous_response_id: lastResponseId || undefined,
-              input: turnInput,
-              stream: true,
-              parallel_tool_calls: false,
-              reasoning,
-              tools: [
-                {
+            const chatMessages: ChatCompletionMessage[] = [];
+            chatMessages.push({ role: "system", content: mergedInstructions })
+            for (const item of turnInput) {
+              if(item.type == 'message'){
+                chatMessages.push({ role: item.role, content: item.content.map(contentItem => (contentItem.text)).join() })
+              }
+            }
+
+            const tools: ChatCompletionTool[] = [
+              {
                   type: "function",
-                  name: "shell",
-                  description: "Runs a shell command, and returns its output.",
-                  strict: false,
-                  parameters: {
-                    type: "object",
-                    properties: {
-                      command: { type: "array", items: { type: "string" } },
-                      workdir: {
-                        type: "string",
-                        description: "The working directory for the command.",
+                  function: {
+                      name: "shell",
+                      description: "Runs a shell command, and returns its output.",
+                      parameters: {
+                          type: "object",
+                          properties: {
+                              command: { type: "array", items: { type: "string" } },
+                              workdir: {
+                                  type: "string",
+                                  description: "The working directory for the command.",
+                              },
+                              timeout: {
+                                  type: "number",
+                                  description:
+                                      "The maximum time to wait for the command to complete in milliseconds.",
+                              },
+                          },
+                          required: ["command"],
+                          additionalProperties: false,
                       },
-                      timeout: {
-                        type: "number",
-                        description:
-                          "The maximum time to wait for the command to complete in milliseconds.",
-                      },
-                    },
-                    required: ["command"],
-                    additionalProperties: false,
-                  },
-                },
-              ],
+                  }
+              },
+            ];
+            // eslint-disable-next-line no-await-in-loop
+            const chatCompletion = await this.oai.chat.completions.create({
+              model: this.model,                
+              messages: chatMessages,
+              stream: true,              
+              tools,
+              tool_choice: "auto",
+            
             });
-            break;
+            
           } catch (error) {
             const isTimeout = error instanceof APIConnectionTimeoutError;
             // Lazily look up the APIConnectionError class at runtime to
@@ -703,28 +771,24 @@ export class AgentLoop {
           }
         }
         turnInput = []; // clear turn input, prepare for function call results
-
         // If the user requested cancellation while we were awaiting the network
         // request, abort immediately before we start handling the stream.
         if (this.canceled || this.hardAbort.signal.aborted) {
           // `stream` is defined; abort to avoid wasting tokens/server work
           try {
-            (
-              stream as { controller?: { abort?: () => void } }
-            )?.controller?.abort?.();
+            (chatCompletion as ChatCompletionStream).controller?.abort?.();
           } catch {
             /* ignore */
           }
           this.onLoading(false);
           return;
         }
-
-        // Keep track of the active stream so it can be aborted on demand.
-        this.currentStream = stream;
-
-        // guard against an undefined stream before iterating
-        if (!stream) {
-          this.onLoading(false);
+          
+          this.currentStream = chatCompletion;
+        
+          // Check if chatCompletion is null before using it
+          if (!chatCompletion) {
+            this.onLoading(false);
           log("AgentLoop.run(): stream is undefined");
           return;
         }
@@ -733,50 +797,48 @@ export class AgentLoop {
           // eslint-disable-next-line no-await-in-loop
           for await (const event of stream) {
             if (isLoggingEnabled()) {
-              log(`AgentLoop.run(): response event ${event.type}`);
+              log(`AgentLoop.run(): response event ${event}`);
             }
 
-            // process and surface each item (no‑op until we can depend on streaming events)
-            if (event.type === "response.output_item.done") {
-              const item = event.item;
-              // 1) if it's a reasoning item, annotate it
-              type ReasoningItem = { type?: string; duration_ms?: number };
-              const maybeReasoning = item as ReasoningItem;
-              if (maybeReasoning.type === "reasoning") {
-                maybeReasoning.duration_ms = Date.now() - thinkingStart;
+            if (event.choices[0].delta.content) {
+              const item: ResponseItem = {
+                id: `error-${Date.now()}`,
+                type: "message",
+                role: "assistant",
+                content: [
+                  {
+                    type: "input_text",
+                    text: event.choices[0].delta.content,
+                  },
+                ],
               }
-              if (item.type === "function_call") {
-                // Track outstanding tool call so we can abort later if needed.
-                // The item comes from the streaming response, therefore it has
-                // either `id` (chat) or `call_id` (responses) – we normalise
-                // by reading both.
-                const callId =
-                  (item as { call_id?: string; id?: string }).call_id ??
-                  (item as { id?: string }).id;
-                if (callId) {
-                  this.pendingAborts.add(callId);
-                }
-              } else {
-                stageItem(item as ResponseItem);
-              }
+              stageItem(item)
+              turnInput.push(item as ResponseInputItem);
             }
 
-            if (event.type === "response.completed") {
+            if(event.choices[0].delta.tool_calls){
+              const functionCall = event.choices[0].delta.tool_calls[0].function;
+              const item = {type:'function_call', function: functionCall, id: event.choices[0].delta.tool_calls[0].id};
+              this.pendingAborts.add(item.id)
+            }
+
+            if (event.choices[0].finish_reason === "tool_calls") {
+              //function call 
+              const item = event.choices[0].message.tool_calls[0];
+              const result = await this.handleFunctionCall(item);
+              turnInput.push(...result);
+            }
+
+            if (event.choices[0].finish_reason === "stop") {
               if (thisGeneration === this.generation && !this.canceled) {
-                for (const item of event.response.output) {
-                  stageItem(item as ResponseItem);
-                }
-              }
-              if (event.response.status === "completed") {
-                // TODO: remove this once we can depend on streaming events
+
                 const newTurnInput = await this.processEventsWithoutStreaming(
                   event.response.output,
                   stageItem,
                 );
                 turnInput = newTurnInput;
               }
-              lastResponseId = event.response.id;
-              this.onLastResponseId(event.response.id);
+              
             }
           }
         } catch (err: unknown) {
@@ -860,7 +922,7 @@ export class AgentLoop {
         //   ],
         // });
 
-        this.onLoading(false);
+        this.onLoading(false);        
       };
 
       // Delay flush slightly to allow a near‑simultaneous cancel() to land.
@@ -1066,9 +1128,9 @@ export class AgentLoop {
   }
 
   // we need until we can depend on streaming events
-  private async processEventsWithoutStreaming(
-    output: Array<ResponseInputItem>,
-    emitItem: (item: ResponseItem) => void,
+  private async processEventsWithoutStreaming(    
+    output: Array<ResponseItem>,
+    emitItem: (item: ResponseItem) => void,    
   ): Promise<Array<ResponseInputItem>> {
     // If the agent has been canceled we should short‑circuit immediately to
     // avoid any further processing (including potentially expensive tool
@@ -1077,15 +1139,13 @@ export class AgentLoop {
     if (this.canceled) {
       return [];
     }
-    const turnInput: Array<ResponseInputItem> = [];
-    for (const item of output) {
-      if (item.type === "function_call") {
-        if (alreadyProcessedResponses.has(item.id)) {
-          continue;
-        }
-        alreadyProcessedResponses.add(item.id);
-        // eslint-disable-next-line no-await-in-loop
-        const result = await this.handleFunctionCall(item);
+    const turnInput: Array<ResponseInputItem> = [];    
+      for (const item of output) {
+        if (item.type === "function_call") {          
+          // eslint-disable-next-line no-await-in-loop
+          const result = await this.handleFunctionCallOld(item as ResponseFunctionToolCall);
+          
+          
         turnInput.push(...result);
       }
       emitItem(item as ResponseItem);
@@ -1140,3 +1200,4 @@ You MUST adhere to the following criteria when executing the task:
 - When your task involves writing or modifying files:
     - Do NOT tell the user to "save the file" or "copy the code into a file" if you already created or modified the file using \`apply_patch\`. Instead, reference the file as already saved.
     - Do NOT show the full contents of large files you have already written, unless the user explicitly asks for them.`;
+
